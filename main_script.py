@@ -11,11 +11,17 @@ from access import Access, weights
 import matplotlib.pyplot as plt
 import matplotlib
 import contextily as ctx
+import osmnx as ox
+from descartes import PolygonPatch
+from time import process_time
+import warnings
+warnings.filterwarnings("ignore")
 import os
-
 os.chdir('/home/lvizuet/Git/geoinfo_pry/')
 
-# Funciones
+'''
+FUNCIONES PARA MODELO DE ACCESIBILIDAD
+'''
 def multi_line(line, dista):
     if line.geom_type == 'MultiLineString':
         segments = []
@@ -49,8 +55,55 @@ def cut(line, distance):
                 LineString(coords[:i] + [(cp.x, cp.y)]),
                 LineString([(cp.x, cp.y)] + coords[i:])]
 
+'''
+FUNCIONES PARA QUADTREES
+'''
+def espacial(puntos, poligono):
+    if len(set(poligono.index.duplicated()))>1:
+        print('CUIDADO, tu poligonos tienen índices repetidos')
+    si = puntos.sindex
+    
+    pmi = []
+    ide = []
+    for poly in poligono.itertuples():
+        c = list(si.intersection(poly.geometry.bounds))
+        pmi += c
+        ide += [poly.Index]*len(c)
+
+    pm = puntos.iloc[list(set(pmi))]
+
+    result = pm.loc[pm.intersects(poligono.unary_union)]
+    result['id_busqueda'] = ide
+    return result
+
+def normal(puntos, poligono):    
+    pm = []
+    ide = []
+    for poly in poligono.itertuples():
+        c = list(puntos.loc[puntos.intersects(poly.geometry)].index)
+        pm += c
+        ide += [poly.Index]*len(c)
+
+    result = puntos.loc[puntos.index.isin(list(set(pm)))]
+    result['id_busqueda'] = ide
+    return result
+
+def buscador(tramo_ciclovia, talleres, zonas, usar_spindex=True):
+    if usar_spindex:
+        step1 = espacial(tramo_ciclovia, zonas).id_busqueda.unique()
+        if len(step1)>0:
+            return espacial(talleres, zonas.iloc[step1, :])
+        else:
+            print('Lo siento, este tramo de ciclovía no está en la CDMX')
+    else:
+        step1 = normal(tramo_ciclovia, zonas).id_busqueda.unique()
+        if len(step1)>0:
+            return normal(talleres, zonas.iloc[step1, :])
+        else:
+            print('Lo siento, este tramo de ciclovía no está en la CDMX')        
+
 #%% Ciclovias
-ciclo = gpd.read_file('data/ciclovias_cdmx.zip')
+ciclo = gpd.read_file('data/ciclovias_cdmx.zip').to_crs(32614)
 ciclo_lines = pd.DataFrame({'ID':[], 'NOMBRE':[], 'TIPO_IC':[], 
                             'VIALIDAD':[], 'TIPO_VIA':[], 'ESTADO':[], 
                             'SENTIDO':[], 'INSTANCIA':[], 'AÑO':[],'geometry':[]})
@@ -66,7 +119,7 @@ for i in range(ciclo.shape[0]):
                          'geometry':(multi_line(ciclo.iloc[i,-1], 1000))})
     ciclo_lines = ciclo_lines.append(df_l)
     
-ciclo_lines = gpd.GeoDataFrame(ciclo_lines)
+ciclo_lines = gpd.GeoDataFrame(ciclo_lines, crs=32614)
 ciclo_lines.reset_index(drop=True, inplace=True)
 ciclo_lines.reset_index(inplace=True)
 ciclo_lines.columns = [x.lower() for x in ciclo_lines.columns]
@@ -175,3 +228,81 @@ plt.tight_layout()
 plt.show()
 
 mapa_accesibilidad.to_crs(32614).to_file('products/ciclovias_accesibilidad.gpkg', driver='GPKG', layer='accesibilidad')
+
+#%%
+# Areas de la ciudad de México 
+cdmx = gpd.read_file("data/cdmx.gpkg").to_crs(3857)[['CVE_ENT', 'geometry']]
+cl = gpd.read_file('products/ciclovias_centroids_demand.gpkg').to_crs(3857)[['id_centroid','geometry']]
+cll = gpd.read_file('products/ciclovias_lines.gpkg').to_crs(3857)
+ta = gpd.read_file('Talleres_Bici.gpkg').to_crs(3857)[['id', 'geometry']]
+
+cdmx_zonas = gpd.GeoDataFrame()
+for i, poly in enumerate(ox.utils_geo._quadrat_cut_geometry(cdmx['geometry'][0], quadrat_width=5000)):
+    cdmx_zonas = cdmx_zonas.append(gpd.GeoDataFrame(index=[i], crs=3857, geometry=[poly]))
+
+fig, ax = plt.subplots(figsize=(10,10))
+cdmx_zonas.boundary.plot(ax=ax, alpha=0.5)
+cdmx_zonas.iloc[[62,63,76,77],:].boundary.plot(ax=ax, color='green')
+cl.plot(ax=ax, color='black', markersize=1)
+ta.plot(ax=ax, color='red', markersize=1)
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
+
+poly = cdmx_zonas.iloc[[62,63,76,77],:]
+
+s=process_time()
+espacial(cl, poly)
+print('Tiempo: ', round(process_time() - s, 4))
+
+s=process_time()
+normal(cl, poly)
+print('Tiempo: ', round(process_time() - s, 4))
+
+s=process_time()
+espacial(cl, cdmx_zonas)
+print('Tiempo: ', round(process_time() - s, 4))
+
+s=process_time()
+normal(cl, cdmx_zonas)
+print('Tiempo: ', round(process_time() - s, 4))
+
+
+# Programa para buscar ciclovias y talleres
+ciclovias = cl.iloc[:2,:]
+resultado = buscador(ciclovias, ta, cdmx_zonas)
+
+fig, ax = plt.subplots(figsize=(10,10))
+cdmx_zonas.boundary.plot(ax=ax, alpha=0.4)
+ta.plot(ax=ax, alpha=0.8, markersize=2, color='black')
+cdmx_zonas.iloc[resultado.id_busqueda.unique()].boundary.plot(ax=ax, color='green')
+resultado.plot(ax=ax, color='black', markersize=2)
+cll.iloc[list(ciclovias.index), :].plot(ax=ax, color='red')
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
+
+ciclovias = cl.iloc[:100,:]
+resultado = buscador(ciclovias, ta, cdmx_zonas)
+
+fig, ax = plt.subplots(figsize=(10,10))
+cdmx_zonas.boundary.plot(ax=ax, alpha=0.4)
+ta.plot(ax=ax, alpha=0.8, markersize=2, color='black')
+cdmx_zonas.iloc[resultado.id_busqueda.unique()].boundary.plot(ax=ax, color='green')
+resultado.plot(ax=ax, color='black', markersize=2)
+cll.iloc[list(ciclovias.index), :].plot(ax=ax, color='red')
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
+
+
+s=process_time()
+buscador(ciclovias, ta, cdmx_zonas)
+print('Tiempo: ', round(process_time() - s, 4))
+
+s=process_time()
+buscador(ciclovias, ta, cdmx_zonas, False)
+print('Tiempo: ', round(process_time() - s, 4))
+
+
+
