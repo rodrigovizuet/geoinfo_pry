@@ -138,21 +138,19 @@ pob = pd.concat([pob,count], axis=1)
 pob['kn'] = pob.kn.fillna(1)
 pob['pob_pond'] = pob['POBTOT']/pob['kn']
 
-
-# YA NO SE QUE MAS PONER.....  HAY CEROS EN ALGUNAS POBLACIONES
-
 for i in range(len(points)):
     cl.loc[cl.geometry==points[i], 'POBTOT'] = int(pob.iloc[knn_points[i],-1].sum())
 
-ax = cl[cl.POBTOT==0].plot()
-cl.plot(ax=ax, markersize=.5)
 
+fig, ax = plt.subplots(figsize=(10,10))
+ax = cl.to_crs(epsg=3857).plot(column='POBTOT', scheme='naturalbreaks', 
+                               alpha=.8, markersize=.5, cmap='OrRd')
+ctx.add_basemap(ax=ax, source=ctx.providers.CartoDB.Positron) 
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
 
-den = gpd.sjoin(pob, cl_buff, how='right', op='within')[['CVEGEO','POBTOT','id_centroid']]
-den = den.groupby('id_centroid', as_index=False).POBTOT.sum()
-den = den.merge(cl, on='id_centroid')
-
-#den = gpd.GeoDataFrame(den[['id_centroid','POBTOT','geometry']]).to_file('products/ciclovias_centroids_demand.gpkg', driver='GPKG', layer='ciclovias')
+gpd.GeoDataFrame(cl[['id_centroid','POBTOT','geometry']]).to_file('products/ciclovias_centroids_demand.gpkg', driver='GPKG', layer='ciclovias')
 
 #%% Modelo de accesibilidad
 cl = gpd.read_file('products/ciclovias_centroids_demand.gpkg')
@@ -227,6 +225,11 @@ plt.show()
 
 mapa_accesibilidad.to_crs(32614).to_file('products/ciclovias_accesibilidad.gpkg', driver='GPKG', layer='accesibilidad')
 
+#%% Modelo de accesibilidad con red de calles
+cl = gpd.read_file('products/ciclovias_centroids_demand.gpkg')
+ta = gpd.read_file('Talleres_Bici.gpkg')
+ta['per_ocu'] = ta.per_ocu.apply(lambda x: 1 if x=='0 a 5 personas' else 2)
+ta = ta.to_crs(32614)
 
 #%% Busqueda
 '''
@@ -234,10 +237,14 @@ mapa_accesibilidad.to_crs(32614).to_file('products/ciclovias_accesibilidad.gpkg'
 ## Indices espaciales ##
 ########################
 '''
+import numpy as np
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import contextily as ctx
+from sklearn.neighbors import BallTree
+from shapely.geometry import *
 from time import process_time
+import osmnx as ox
 import warnings
 warnings.filterwarnings("ignore")
 import os
@@ -289,7 +296,15 @@ def buscador(tramo_ciclovia, talleres, zonas, usar_spindex=True):
         if len(step1)>0:
             return normal(talleres, zonas.iloc[step1, :])
         else:
-            print('Lo siento, este tramo de ciclovía no está en la CDMX')        
+            print('Lo siento, este tramo de ciclovía no está en la CDMX')     
+
+def buscador_ball(tramo_ciclovia, talleres, radio):
+    t = np.array(list(talleres.geometry.apply(lambda x: (x.x, x.y))))
+    c = np.array(list(tramo_ciclovia.geometry.apply(lambda x: (x.x, x.y))))
+    btree = BallTree(t)
+    idx = btree.query_radius(c, radio)
+    idx = [list(x) for x in idx]
+    return c, t, idx
 
 
 #%%
@@ -358,15 +373,31 @@ ax.set_axis_off()
 plt.tight_layout()
 plt.show()
 
+ciclovias = cl.iloc[:100,:]
+cl_geom, _, idx = buscador_ball(ciclovias, ta, 2000)
+cl_geom = [Point(x) for x in cl_geom]
+idx = list(set([i for j in idx for i in j]))
+
+fig, ax = plt.subplots(figsize=(10,10))
+cll.plot(ax=ax, alpha=0.5, color='gray')
+cll.iloc[list(cl[cl.geometry.isin(cl_geom)].id_centroid),:].plot(ax=ax,color='green',alpha=0.5)
+ta.iloc[idx, :].plot(ax=ax, color='red', markersize=2.5)
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
+
 
 s=process_time()
-buscador(ciclovias, ta, cdmx_zonas)
+buscador(cl, ta, cdmx_zonas)
 print('Tiempo: ', round(process_time() - s, 4))
 
 s=process_time()
-buscador(ciclovias, ta, cdmx_zonas, False)
+buscador_ball(cl, ta, 1500)
 print('Tiempo: ', round(process_time() - s, 4))
 
+s=process_time()
+buscador(cl, ta, cdmx_zonas, False)
+print('Tiempo: ', round(process_time() - s, 4))
 
 
 #%%
