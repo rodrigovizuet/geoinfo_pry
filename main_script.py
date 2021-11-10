@@ -7,12 +7,15 @@
 import pandas as pd
 import numpy as np
 import geopandas as gpd
+import re
+import statsmodels.formula.api as smf
 from sklearn.neighbors import BallTree
 from shapely.geometry import *
 from shapely.ops import nearest_points
-from access import access, weights
+from access import Access, weights
 import matplotlib.pyplot as plt
 import matplotlib
+import seaborn as sns
 import contextily as ctx
 import warnings
 warnings.filterwarnings("ignore")
@@ -77,6 +80,18 @@ def KN(gdA, gdB, knn=5,dist_lim=1000):
             del nA[i]
     return [Point(x) for x in nA], idx
 
+def nconv(n):
+    try: 
+        return float(n)
+    except:
+        return n
+    
+def var_rev(df, v_int):
+    for v in v_int:  
+        r = [x for x in list(df[v]) if re.search('\D', str(x))]
+        r = [x for x in r if type(nconv(x))==str]
+        print(v, set(r), round(len(r)/df.shape[0]*100,4))
+    
 #%% Ciclovias
 ciclo = gpd.read_file('data/ciclovias_cdmx.zip').to_crs(32614)
 ciclo_lines = pd.DataFrame({'ID':[], 'NOMBRE':[], 'TIPO_IC':[], 
@@ -112,34 +127,80 @@ ciclo_centroids.to_file('products/ciclovias_centroids.gpkg', driver='GPKG', laye
 del ciclo, df_l, i
 
 #%% Modelo de demanda
-cdmx = gpd.read_file("data/agebs_cdmx_2020.zip").to_crs(32614)[['CVEGEO', 'geometry']]
-cdmx.iloc[:,1] = cdmx.geometry.centroid
+mza = gpd.read_file('data/manzanas_cdmx.gpkg').to_crs(32614)
+pob = pd.read_csv("data/conjunto_de_datos_ageb_urbana_09_cpv2020.zip", dtype={'ENTIDAD':str, 'MUN':str, 'LOC':str, 'AGEB':str, 'MZA':str})
+pob['CVEGEO'] = pob['ENTIDAD'] + pob['MUN'] + pob['LOC'] + pob['AGEB'] + pob['MZA']
+bi = pd.merge(mza, pob, on='CVEGEO', how='left')
+del mza, pob
+# Eliminar missing
+bi = bi[~bi.GRAPROES.isna()]
+
+v_int = ['VPH_BICI','P_12YMAS','P_60YMAS','PDESOCUP',
+         'GRAPROES', 'VPH_NDACMM','POCUPADA']
+# Revisar valores
+var_rev(bi, v_int)
+
+# Asumir que hay al menos una persona o vivienda con dicha condición
+for i in ['P_12YMAS', 'P_60YMAS','VPH_NDACMM','POCUPADA']:
+    bi[i] = bi[i].replace('*',1)
+
+var_rev(bi, v_int)
+
+# Meter promedio en grado de escolaridad para no afectar regresion
+esco = bi[(bi.GRAPROES!='N/D')&(bi.GRAPROES!='*')]
+esco['GRAPROES'] = esco.GRAPROES.astype(float)
+esco['CVEGEO'] = esco.CVEGEO.apply(lambda x: x[:-7])
+esco = esco.groupby('CVEGEO').GRAPROES.mean()
+idx = bi[bi.GRAPROES=='*'].index
+for i in idx:
+    bi.loc[i, 'GRAPROES'] = esco[bi.loc[i, 'CVEGEO'][:-7]]
+del esco
+
+var_rev(bi, v_int)
+# Eliminar los otros missing values de variables dependientes
+bi = bi[bi.GRAPROES!='N/D']
+var_rev(bi, v_int)
+
+# Modelo de regresión para completar VPH_BICI
+v_mod = ['VPH_BICI','P_12YMAS','P_60YMAS','GRAPROES','VPH_NDACMM','POCUPADA']
+bi_mod = bi[v_mod][bi.VPH_BICI!='*']
+for v in ['VPH_BICI','P_12YMAS','P_60YMAS','GRAPROES','VPH_NDACMM','POCUPADA']:
+    bi_mod[v] = bi_mod[v].astype(float)
+    if v!='VPH_BICI':
+        bi[v] = bi[v].astype(float)
+
+bi_mod['pob'] = bi_mod['P_12YMAS'] - bi_mod['P_60YMAS']
+bi_mod['pocu'] = bi_mod['POCUPADA']/bi_mod['P_12YMAS']
+mod = smf.ols('VPH_BICI ~ pob + GRAPROES + pocu + VPH_NDACMM', data=bi_mod).fit()
+print(mod.summary())
+
+bi['pob'] = bi['P_12YMAS'] - bi['P_60YMAS']
+bi['pocu'] = bi['POCUPADA']/bi['P_12YMAS']
+bi['bici_pred'] = mod.predict(exog=bi[['pob','GRAPROES','pocu','VPH_NDACMM']])
+bi.loc[bi.VPH_BICI=='*','VPH_BICI'] = bi.loc[bi.VPH_BICI=='*','bici_pred'] 
+var_rev(bi, v_int)
+bi['VPH_BICI'] = bi.VPH_BICI.astype(float)
+bi.loc[bi.VPH_BICI<0, 'VPH_BICI'] = 0
+bi.VPH_BICI.describe()
+
+# Otener cetroides
+bi['geometry'] = bi.geometry.centroid
+
+# Cargar centroides de tramos de ciclovias
 cl = gpd.GeoDataFrame(gpd.read_file('products/ciclovias_centroids.gpkg'), geometry='geometry', crs=32614)[['id_centroid','geometry']]
 
-pob = pd.read_csv("data/conjunto_de_datos_ageb_urbana_09_cpv2020.zip", dtype={'ENTIDAD':str, 'MUN':str, 'LOC':str, 'AGEB':str})
-pob['CVEGEO'] = pob['ENTIDAD'] + pob['MUN'] + pob['LOC'] + pob['AGEB']
-pob = pob[['CVEGEO','P_8A14','P_15A17','P_18YMAS','P_60YMAS']]
-for i in ['P_8A14','P_15A17','P_18YMAS','P_60YMAS']:
-    pob[i] = pob[i].replace('*',1)
-    pob[i] = pob[i].replace('N/D',np.nan)
-    pob[i] = pob[i].astype(float)
-
-pob['POBTOT'] = pob['P_8A14'] + pob['P_15A17']+pob['P_18YMAS']-pob['P_60YMAS']
-pob = pob[['CVEGEO', 'POBTOT']]
-pob = gpd.GeoDataFrame(pob.merge(cdmx, on='CVEGEO'))
-
-points, knn_points = KN(cl, pob, 3, 1500)
+points, knn_points = KN(cl, bi, 3, 1000)
 
 count = pd.DataFrame({'idx':[j for i in knn_points for j in i]}).value_counts().reset_index()
 count.columns = ['idx','kn']
 count.set_index('idx', inplace=True)
 
-pob = pd.concat([pob,count], axis=1)
-pob['kn'] = pob.kn.fillna(1)
-pob['pob_pond'] = pob['POBTOT']/pob['kn']
+dem = pd.concat([bi,count], axis=1)
+dem['kn'] = dem.kn.fillna(1)
+dem['demanda_pond'] = dem['VPH_BICI']/dem['kn']
 
 for i in range(len(points)):
-    cl.loc[cl.geometry==points[i], 'POBTOT'] = int(pob.iloc[knn_points[i],-1].sum())
+    cl.loc[cl.geometry==points[i], 'POBTOT'] = int(dem.iloc[knn_points[i],-1].sum())
 
 
 fig, ax = plt.subplots(figsize=(10,10))
@@ -153,70 +214,133 @@ plt.show()
 gpd.GeoDataFrame(cl[['id_centroid','POBTOT','geometry']]).to_file('products/ciclovias_centroids_demand.gpkg', driver='GPKG', layer='ciclovias')
 
 #%% Modelo de accesibilidad
-cl = gpd.read_file('products/ciclovias_centroids_demand.gpkg')
+cl = gpd.read_file('products/ciclovias_centroids_demand.gpkg').to_crs(epsg=3857)
+
 ta = gpd.read_file('Talleres_Bici.gpkg')
 ta['per_ocu'] = ta.per_ocu.apply(lambda x: 1 if x=='0 a 5 personas' else 2)
-ta = ta.to_crs(32614)
+ta = ta.to_crs(epsg=3857)
 
-cost = pd.merge(cl[['id_centroid']], ta[['id']], left_on='id_centroid',
-                right_on='id', how='outer')
-cost['cost'] = 0
-cost.columns = ['origen', 'destino', 'cost']
+fig, ax = plt.subplots(figsize=(10,10))
+ax = cl.plot(column='POBTOT', scheme='naturalbreaks', 
+             markersize=.5, cmap='OrRd')
+ta.plot(ax=ax, markersize=0.5, alpha=0.8)
+ctx.add_basemap(ax=ax, source=ctx.providers.CartoDB.Positron) 
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
+
 # Instanciamos un objeto de la clase Access
-A = access(demand_df            = cl,
+A = Access(demand_df            = cl,
            demand_index         = 'id_centroid',
            demand_value         = 'POBTOT',
            supply_df            = ta,
            supply_index         = 'id',
-           supply_value         = 'per_ocu',
-           cost_df              = cost,
-           cost_origin          = 'origen',
-           cost_dest            = 'destino',
-           cost_name            = 'cost')
+           supply_value         = 'per_ocu')
 
 # Calculamos las distancias
 A.create_euclidean_distance(threshold = 250000, centroid_o = True, centroid_d = True)
-cost = A.cost_df[['origen','destino','euclidean']]
-cost.to_csv('products/euclidian_cost.csv')
+cost = A.cost_df
+gravity = weights.gravity(scale = 60, alpha = -1)
+gravity_mod = A.weighted_catchment(name='gravity', weight_fn=gravity)
 
-A = access(demand_df            = cl,
+fig = cl[['id_centroid','geometry']].set_index('id_centroid').join(A.access_df, how='inner')
+base = fig.plot('gravity_per_ocu', legend = True, 
+                figsize = (8, 8), 
+                cmap = 'viridis', 
+                markersize = .5, 
+                alpha = 1,
+                vmin = fig['gravity_per_ocu'].quantile(0.05), 
+                vmax = fig['gravity_per_ocu'].quantile(0.95))
+# Plot it twice, so that the points' edgecolor does not hide other points' centers.
+ta.plot(ax=base, markersize=20, color='white')
+ta.plot(ax=base, markersize=5, color='red', edgecolor = "white", linewidth = 0)
+base.set_axis_off()
+    
+
+A = Access(demand_df            = cl,
            demand_index         = 'id_centroid',
            demand_value         = 'POBTOT',
            supply_df            = ta,
            supply_index         = 'id',
            supply_value         = 'per_ocu',
            cost_df              = cost,
-           cost_origin          = 'origen',
-           cost_dest            = 'destino',
+           cost_origin          = 'origin',
+           cost_dest            = 'dest',
            cost_name            = 'euclidean')
+raam_mod = A.raam(name='raam')
 
-gaussian = weights.gaussian(750)
-gravity = weights.gravity(scale = 750, alpha = -1)
-A.weighted_catchment(name = "gravity",  weight_fn = gaussian)
-A.raam(name = "raam", tau = 750)
-
-# Guardamos los modelos por si los queremos reutilizar
-A.norm_access_df.to_csv("products/accesibilidad_distancia_euclidiana.csv")
-
-mapa_accesibilidad = cl.set_index('id_centroid')[['geometry']].join(A.norm_access_df, how = "inner")
-mapa_accesibilidad.columns = ['geometry','gravity','raam']
-
-fig, ax = plt.subplots(1,2, figsize=(20,15))
 cmap = matplotlib.cm.viridis
-mapa_accesibilidad.to_crs(epsg=3857).plot('raam', legend = True,
+fig = cl[['id_centroid','geometry']].set_index('id_centroid').join(A.access_df, how='inner')
+base = fig.plot('raam_per_ocu', legend = True, 
+                figsize = (8, 8), 
+                cmap = cmap.reversed(), 
+                markersize = .5, 
+                alpha = 1,
+                vmin = fig['raam_per_ocu'].quantile(0.05), 
+                vmax = fig['raam_per_ocu'].quantile(0.95))
+# Plot it twice, so that the points' edgecolor does not hide other points' centers.
+ta.plot(ax=base, markersize=20, color='white')
+ta.plot(ax=base, markersize=5, color='red', edgecolor = "white", linewidth = 0)
+base.set_axis_off()
+
+
+mapa_accesibilidad = cl.set_index('id_centroid')[['geometry','POBTOT']].join([gravity_mod,raam_mod], how = "inner")
+mapa_accesibilidad.columns = ['geometry','demanda','gravity','raam']
+
+fig, ax = plt.subplots(1,3, figsize=(25,15))
+cmap = matplotlib.cm.viridis
+mapa_accesibilidad.to_crs(epsg=3857).plot('raam', legend = False,
                                           cmap =  cmap.reversed(), 
                                           markersize = 7, alpha = 0.6, ax = ax[0],
                                           vmin = mapa_accesibilidad['raam'].quantile(0.05), 
                                           vmax = mapa_accesibilidad['raam'].quantile(0.95),
                                           )
-mapa_accesibilidad.to_crs(epsg=3857).plot('gravity', legend = True,
+mapa_accesibilidad.to_crs(epsg=3857).plot('gravity', legend = False,
                                           cmap =  cmap, 
                                           markersize = 7, alpha = 0.6, ax = ax[1],
                                           vmin = mapa_accesibilidad['gravity'].quantile(0.05), 
                                           vmax = mapa_accesibilidad['gravity'].quantile(0.95),
                                           )
+mapa_accesibilidad.to_crs(epsg=3857).plot('demanda', legend = False,
+                                          cmap = 'OrRd', 
+                                          markersize = 7, alpha = 0.6, ax = ax[2],
+                                          vmin = mapa_accesibilidad['demanda'].quantile(0.05), 
+                                          vmax = mapa_accesibilidad['demanda'].quantile(0.95),
+                                          )
 ax[0].set(title='Modelo RAAM')
 ax[1].set(title='Modelo Gravitatorio')
+ax[2].set(title='Demanda estimada: número de viviendas\nque usa la bicicleta como medio de transporte')
+for i in range(len(ax)):
+    ax[i].set_axis_off()
+    ctx.add_basemap(ax[i], source=ctx.providers.CartoDB.Positron)    
+plt.tight_layout()
+plt.show()
+
+
+# Mapas con ciclovias lineales
+cll = gpd.read_file('products/ciclovias_lines.gpkg').to_crs(3857)
+cll = cll.join(mapa_accesibilidad[['raam','gravity','demanda']])
+
+fig, ax = plt.subplots(1,3, figsize=(25,15))
+cmap = matplotlib.cm.viridis
+cll.to_crs(epsg=3857).plot('raam', legend = False,
+                           cmap =  cmap.reversed(), 
+                           markersize = 7, alpha = 0.6, ax = ax[0],
+                           vmin = mapa_accesibilidad['raam'].quantile(0.05), 
+                           vmax = mapa_accesibilidad['raam'].quantile(0.95))
+cll.to_crs(epsg=3857).plot('gravity', legend = False,
+                           cmap =  cmap, 
+                           markersize = 7, alpha = 0.6, ax = ax[1],
+                           vmin = mapa_accesibilidad['gravity'].quantile(0.05),
+                           vmax = mapa_accesibilidad['gravity'].quantile(0.95))
+cll.to_crs(epsg=3857).plot('demanda', legend = False,
+                           cmap = 'OrRd', 
+                           markersize = 7, alpha = 0.6, ax = ax[2],
+                           vmin = mapa_accesibilidad['demanda'].quantile(0.05), 
+                           vmax = mapa_accesibilidad['demanda'].quantile(0.95))
+ax[0].set(title='Modelo RAAM')
+ax[1].set(title='Modelo Gravitatorio')
+ax[2].set(title='Demanda estimada: número de viviendas\nque usa la bicicleta como medio de transporte')
 for i in range(len(ax)):
     ax[i].set_axis_off()
     ctx.add_basemap(ax[i], source=ctx.providers.CartoDB.Positron)    
@@ -224,12 +348,6 @@ plt.tight_layout()
 plt.show()
 
 mapa_accesibilidad.to_crs(32614).to_file('products/ciclovias_accesibilidad.gpkg', driver='GPKG', layer='accesibilidad')
-
-#%% Modelo de accesibilidad con red de calles
-cl = gpd.read_file('products/ciclovias_centroids_demand.gpkg')
-ta = gpd.read_file('Talleres_Bici.gpkg')
-ta['per_ocu'] = ta.per_ocu.apply(lambda x: 1 if x=='0 a 5 personas' else 2)
-ta = ta.to_crs(32614)
 
 #%% Busqueda
 '''
@@ -323,27 +441,36 @@ cdmx_zonas.boundary.plot(ax=ax, alpha=0.5)
 cdmx_zonas.iloc[[62,63,76,77],:].boundary.plot(ax=ax, color='green')
 cl.plot(ax=ax, color='black', markersize=1)
 ta.plot(ax=ax, color='red', markersize=1)
+ctx.add_basemap(ax=ax, source=ctx.providers.CartoDB.Positron)  
 ax.set_axis_off()
+plt.title('\nBusqueda por cuadrantes\n')
 plt.tight_layout()
 plt.show()
+
 
 poly = cdmx_zonas.iloc[[62,63,76,77],:]
 
 s=process_time()
 espacial(cl, poly)
-print('Tiempo: ', round(process_time() - s, 4))
+s1 = process_time() - s
+print('Tiempo con submuestra e índice espacial: ', round(s1, 4))
 
 s=process_time()
 normal(cl, poly)
-print('Tiempo: ', round(process_time() - s, 4))
+s2 = process_time() - s
+print('Tiempo con submuestra SIN índice espacial: ', round(s2, 4))
+print('Razón de diferencia: ', round(s2/s1-1, 2))
 
 s=process_time()
 espacial(cl, cdmx_zonas)
-print('Tiempo: ', round(process_time() - s, 4))
+s1 = process_time() - s
+print('Tiempo con todos e índice espacial: ', round(s1, 4))
 
 s=process_time()
 normal(cl, cdmx_zonas)
-print('Tiempo: ', round(process_time() - s, 4))
+s2 = process_time() - s
+print('Tiempo con todos SIN índice espacial: ', round(s2, 4))
+print('Razón de diferencia: ', round(s2/s1-1, 2))
 
 
 # Programa para buscar ciclovias y talleres
@@ -356,7 +483,9 @@ ta.plot(ax=ax, alpha=0.8, markersize=2, color='black')
 cdmx_zonas.iloc[resultado.id_busqueda.unique()].boundary.plot(ax=ax, color='green')
 resultado.plot(ax=ax, color='black', markersize=2)
 cll.iloc[list(ciclovias.index), :].plot(ax=ax, color='red')
+ctx.add_basemap(ax=ax, source=ctx.providers.CartoDB.Positron)  
 ax.set_axis_off()
+plt.title('\nBusqueda en un solo cuadrante\n')
 plt.tight_layout()
 plt.show()
 
@@ -369,7 +498,9 @@ ta.plot(ax=ax, alpha=0.8, markersize=2, color='black')
 cdmx_zonas.iloc[resultado.id_busqueda.unique()].boundary.plot(ax=ax, color='green')
 resultado.plot(ax=ax, color='black', markersize=2)
 cll.iloc[list(ciclovias.index), :].plot(ax=ax, color='red')
+ctx.add_basemap(ax=ax, source=ctx.providers.CartoDB.Positron)  
 ax.set_axis_off()
+plt.title('\nBusqueda en varios cuadrantes\n')
 plt.tight_layout()
 plt.show()
 
@@ -380,25 +511,31 @@ idx = list(set([i for j in idx for i in j]))
 
 fig, ax = plt.subplots(figsize=(10,10))
 cll.plot(ax=ax, alpha=0.5, color='gray')
+cdmx.boundary.plot(ax=ax, alpha=0.4)
 cll.iloc[list(cl[cl.geometry.isin(cl_geom)].id_centroid),:].plot(ax=ax,color='green',alpha=0.5)
 ta.iloc[idx, :].plot(ax=ax, color='red', markersize=2.5)
+ctx.add_basemap(ax=ax, source=ctx.providers.CartoDB.Positron)  
 ax.set_axis_off()
+plt.title('Busqueda de taller con BallTree\n')
 plt.tight_layout()
 plt.show()
 
-
 s=process_time()
 buscador(cl, ta, cdmx_zonas)
-print('Tiempo: ', round(process_time() - s, 4))
+s1= process_time() - s
+print('Tiempo con RTree: ', round(s1, 4))
 
 s=process_time()
 buscador_ball(cl, ta, 1500)
-print('Tiempo: ', round(process_time() - s, 4))
+s2= process_time() - s
+print('Tiempo con BallTree: ', round(s2, 4))
 
 s=process_time()
 buscador(cl, ta, cdmx_zonas, False)
-print('Tiempo: ', round(process_time() - s, 4))
+s3= process_time() - s
+print('Tiempo sin índice : ', round(s3, 4))
 
+print('Diference respecto al RTree {}, y al Ball {}'.format(round(s3/s1-1, 3), round(s3/s2-1, 3)))
 
 #%%
 '''
@@ -406,6 +543,109 @@ print('Tiempo: ', round(process_time() - s, 4))
 ## PARALELIZACION ##
 ####################
 '''
+# Paqueteria
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+from joblib import Parallel, delayed
+import itertools
+import seaborn as sns
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+import os
+os.chdir('C:/lrgv/CruzRoja/1.Investigacion/')
+gitdir = 'C:/lrgv/Git/cruzroja/'
+shpfile = 'C:/lrgv/Shapefiles/'
+plt.style.use('seaborn-white')
 
+#%% Funciones
+def cie(df, var_cie, n_cie=None):
+    if n_cie!=None:
+        df[var_cie] = df[var_cie].apply(lambda x: x[:n_cie])
+    cie = pd.read_csv('datos/Lesiones/Catalogos_Lesiones_2020/CAT_CIE-10_2020.csv', 
+                      index_col=None, encoding='latin')[['Clave','Nombre']].rename(columns={'Clave':var_cie})
+    return pd.merge(df, cie, on=var_cie, how='left')
+
+def prehosp(series):
+    if series==1:
+        return 'Si'
+    elif series==2:
+        return 'No'
+    else:
+        np.nan
+
+def pal_lineas(txt):
+    t = []
+    if len(txt.split(' '))>4:
+        c = 4
+        while c<len(txt.split(' ')):
+            t.append(' '.join(txt.split(' ')[c-4:c]) + '\n')
+            c+=4
+        t.append(' '.join(txt.split(' ')[c-4:]))
+        return ' '.join(t)
+    else:
+        return txt
+        
+def graph_map_bar(info):
+    for i in range(len(info[0])):
+        df = gpd.GeoDataFrame(pd.DataFrame(info[i][0]), geometry=0, crs=3857)
+        df.columns = ['geometry','values']
+        df['values'] = df['values'].astype(float)
+        dff = pd.DataFrame(info[1][i])
+        dff.columns = ['tipo','value']
+        dff.iloc[:,0] = dff.iloc[:,0].apply(lambda x: pal_lineas(x))
+        
+        fig, ax = plt.subplots(1,2,figsize=(20,8), gridspec_kw={'width_ratios': [1, 2]})
+        sns.barplot(data=dff, x='value', y='tipo', ax=ax[0], 
+                    palette=reversed(sns.color_palette('Blues', dff.shape[0])))
+        df.plot('values', cmap='Blues', scheme='naturalbreaks', ax=ax[1])
+        ax[1].set_axis_off()
+        ax[0].set_title('Principales afecciones de lesiones\nque requirieron atención prehospitalaria')
+        ax[0].set_ylabel('')
+        ax[0].set_xlabel('')
+        ax[1].set_title('Concentración de lesiones que \nrequirieron atención prehospitalaria')
+        plt.tight_layout()
+        plt.show()
+
+#%%
+def map_bar(ent):
+    shp = gpd.read_file(shpfile + 'Localidad urbana/Localidades_urbanas2013.shp')[['ClAVE','geometry']]
+    shp.columns = ['cvegeo','geometry']
+    shp.set_index('cvegeo', inplace=True)
+    resultados = [[],[]]
+    les = pd.read_csv('datos/Lesiones/Lesiones_2020/D_Evento.txt', index_col='ID',
+                      dtype={'CodEstado':str, 'CodMunicipio':str, 'CodLocalidad':str})
+    les = les[les.CodLocalidad!='9999']
+    les['cvegeo'] = les['CodEstado'] + les['CodMunicipio'] + les['CodLocalidad']
+    les['CodPrehospitalaria'] = les.CodPrehospitalaria.apply(lambda x: prehosp(x))
+    # Generar lesiones por localidad que usaron servicios prehosp
+    df = les[les.CodEstado==ent].groupby(['cvegeo','CodPrehospitalaria']).size().unstack()
+    df.fillna(0, inplace=True)
+    df['les_per100'] = round(df.iloc[:,1]/((df.iloc[:,1]+df.iloc[:,0])/100),0)
+    df = pd.concat([df, shp], axis=1, join='inner')
+    resultados[0].append(np.array(df[['geometry','les_per100']]))
+    del df
+    
+    df= les[(les.CodEstado==ent)&(les.CodPrehospitalaria=='Si')].groupby(['cvegeo','AFECPRIN'], as_index=False).size()
+    df = cie(df, 'AFECPRIN', 3)
+    df = df.groupby(['AFECPRIN','Nombre'], as_index=False)['size'].sum()
+    df.sort_values('size',ascending=False, inplace=True)
+    resultados[1].append(np.array(df.head(10)[['Nombre','size']]))
+    del df
+    return resultados
+
+var_edos = [str(x).zfill(2) for x in list(range(1,33))]
+r = map_bar(var_edos[8])
+
+graph_map_bar(r)
+
+%%time
+r = []
+for i in var_edos:
+    r.append(map_bar(i))
+
+%%time
+r = Parallel(n_jobs=1,backend='multiprocessing')(delayed(map_bar)(i) for i in var_edos)
 
 
